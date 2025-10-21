@@ -3,9 +3,22 @@ const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 
 /**
  * Beslisregels TO:
- * - Test (bypass header aanwezig)  -> TO = info@huisverkoopklaar.nl
- * - Anders (normale productie)     -> TO = body.email (verplicht)
- *   (Als body.email toch ontbreekt, val alsnog terug op info@ om "Missing to" te voorkomen)
+ * - Als query ?force_to=info  -> altijd TO=info@huisverkoopklaar.nl  (handig voor cURL tests)
+ * - Anders: TO = body.email, maar met harde fallback naar info@huisverkoopklaar.nl
+ *   (zo kan "Missing to" niet meer voorkomen)
+ * - BCC is altijd j.de*
+
+cat > api/send-pdf.js <<'EOF'
+const { Resend } = require("resend");
+const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
+
+/**
+ * Beslisregels TO:
+ * - Als query ?force_to=info  -> altijd TO=info@huisverkoopklaar.nl  (handig voor cURL tests)
+ * - Anders: TO = body.email, maar met harde fallback naar info@huisverkoopklaar.nl
+ *   (zo kan "Missing to" niet meer voorkomen)
+ * - BCC is altijd j.dekker@huisverkoopklaar.nl
+ * - reply_to = gebruiker (contact.email of body.email), fallback info@
  */
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
@@ -14,14 +27,16 @@ module.exports = async (req, res) => {
 
   try {
     const resend = new Resend(process.env.RESEND_API_KEY);
+
+    // Body veilig parsen
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const { email, subject, cta_url, contact, resultaat } = body;
 
-    // Testmodus: als je via curl de Vercel-bypass header meestuurt, sturen we naar info@
-    const bypassHeader = req.headers["x-vercel-protection-bypass"];
-    const isTest = Boolean(bypassHeader);
+    // Testschakelaar via query
+    const forceToInfo = (req.query && (req.query.force_to === 'info' || req.query.forceTo === 'info'));
 
-    const TO = isTest ? "info@huisverkoopklaar.nl" : (email || "info@huisverkoopklaar.nl");
+    // Definitieve ontvangers
+    const TO  = forceToInfo ? "info@huisverkoopklaar.nl" : (email || "info@huisverkoopklaar.nl");
     const BCC = "j.dekker@huisverkoopklaar.nl";
     const REPLY_TO = (contact && contact.email) || email || "info@huisverkoopklaar.nl";
 
@@ -53,6 +68,14 @@ module.exports = async (req, res) => {
 
     const pdfBytes = await pdfDoc.save();
 
+    // Debug in logs om zeker te weten wat er gebeurt
+    console.log("send-pdf debug", {
+      forceToInfo,
+      payloadEmail: email,
+      computedTo: TO,
+      reply_to: REPLY_TO
+    });
+
     // --- Versturen via Resend ---
     const data = await resend.emails.send({
       from: "info@huisverkoopklaar.nl",
@@ -69,7 +92,13 @@ module.exports = async (req, res) => {
       ],
     });
 
-    return res.status(200).json({ ok: true, id: data?.id || null, to: TO, test: isTest });
+    return res.status(200).json({
+      ok: true,
+      id: data?.id || null,
+      to: TO,
+      reply_to: REPLY_TO,
+      forced: !!forceToInfo
+    });
   } catch (err) {
     console.error("send-pdf error:", err);
     return res.status(500).json({
