@@ -1,32 +1,44 @@
-import { Resend } from "resend";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+const { Resend } = require("resend");
+const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+module.exports = async (req, res) => {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // Testschakelaar + debug via query
+  const q = req.query || {};
+  const forceToInfo = q.force_to === "info" || q.forceTo === "info";
+  const debugMode   = q.debug === "1" || q.debug === "true";
 
   try {
     const resend = new Resend(process.env.RESEND_API_KEY);
-    const { email, subject, cta_url, contact, resultaat } = req.body;
 
+    // Body veilig parsen
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const { email, subject, cta_url, contact, resultaat } = body;
+
+    // TO-logica (nooit meer "Missing to")
+    const TO  = forceToInfo ? "info@huisverkoopklaar.nl" : (email || "info@huisverkoopklaar.nl");
+    const BCC = "j.dekker@huisverkoopklaar.nl";
+    const REPLY_TO = (contact && contact.email) || email || "info@huisverkoopklaar.nl";
+
+    // FROM moet een bij Resend geverifieerde afzender zijn.
+    // Zet deze in Vercel: RESEND_FROM=info@huisverkoopklaar.nl (na domain/sender verification)
+    // Tijdelijke fallback om te testen: onboarding@resend.dev
+    const FROM = process.env.RESEND_FROM || "onboarding@resend.dev";
+
+    // --- PDF generatie (ASCII-safe) ---
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage();
-    const { width, height } = page.getSize();
+    const { height } = page.getSize();
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-
-    const safeText = (t) =>
-      String(t || "")
-        .replace(/[^\x00-\x7F]/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
+    const safe = (t) => String(t || "").replace(/[^\x00-\x7F]/g, "").replace(/\s+/g, " ").trim();
 
     const lines = [
       `Huisverkoopklaar - Waarderapport`,
-      `Naam: ${safeText(contact?.naam)}`,
-      `E-mail: ${safeText(contact?.email)}`,
-      `Geschatte waarde: €${safeText(resultaat?.waarde_min)} - €${safeText(resultaat?.waarde_max)}`,
-      `Afspraaklink: ${cta_url}`,
+      `Naam: ${safe(contact?.naam)}`,
+      `E-mail: ${safe(contact?.email)}`,
+      `Geschatte waarde: €${safe(resultaat?.waarde_min)} - €${safe(resultaat?.waarde_max)}`,
+      `Afspraaklink: ${safe(cta_url)}`
     ];
 
     let y = height - 50;
@@ -34,29 +46,26 @@ export default async function handler(req, res) {
       page.drawText(line, { x: 50, y, size: 12, font, color: rgb(0, 0, 0) });
       y -= 20;
     }
-
     const pdfBytes = await pdfDoc.save();
 
+    console.log("send-pdf debug", { computedTo: TO, reply_to: REPLY_TO, from: FROM, forceToInfo, hasKey: !!process.env.RESEND_API_KEY });
+
     const data = await resend.emails.send({
-      from: "info@huisverkoopklaar.nl",
-      to: email,
-      bcc: "j.dekker@huisverkoopklaar.nl",
-      subject: subject || "Jouw woningwaarde",
-      text: "Hierbij jouw woningwaarde PDF.",
-      attachments: [
-        {
-          filename: "woningwaarde.pdf",
-          content: Buffer.from(pdfBytes).toString("base64"),
-        },
-      ],
+      from: FROM,
+      to: TO,
+      bcc: BCC,
+      reply_to: REPLY_TO,
+      subject: subject || "Waarderapport",
+      text: "In de bijlage vind je het PDF-waarderapport.",
+      attachments: [{ filename: "waarderapport.pdf", content: Buffer.from(pdfBytes).toString("base64") }],
     });
 
-    return res.status(200).json({ ok: true, id: data.id, to: email });
+    return res.status(200).json({ ok: true, id: data?.id || null, to: TO, from: FROM, forced: !!forceToInfo });
   } catch (err) {
-    console.error("Error:", err);
-    return res.status(500).json({
-      error: "Onverwachte serverfout",
-      details: err.message || String(err),
-    });
+    console.error("send-pdf error:", err);
+    const payload = { error: "Onverwachte serverfout" };
+    // In test/debug modus geven we de *echte* fout terug (handig tijdens debuggen)
+    if (forceToInfo || debugMode) payload.details = err?.message || String(err);
+    return res.status(500).json(payload);
   }
-}
+};
