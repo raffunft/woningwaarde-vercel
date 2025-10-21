@@ -1,70 +1,80 @@
+const { Resend } = require("resend");
+const { PDFDocument, StandardFonts, rgb } = require("pdf-lib");
+
 /**
- * POST /api/send
- * Body (JSON):
- *  { to: "naam@domein.nl", subject?: "…", html?: "<p>…</p>", text?: "…",
- *    bcc?: ["mail@domein.nl"], attachments?: [{ name: "rapport.pdf", content: "<base64>" }] }
- *
- * Vereist ENV vars (Vercel → Settings → Environment Variables):
- *  - BREVO_API_KEY
- *  - FROM_EMAIL   (bijv. no-reply@huisverkoopklaar.nl)
- *  - BCC_EMAIL    (optioneel; wordt standaard toegevoegd als bcc)
+ * Beslisregels TO:
+ * - Test (bypass header aanwezig)  -> TO = info@huisverkoopklaar.nl
+ * - Anders (normale productie)     -> TO = body.email (verplicht)
+ *   (Als body.email toch ontbreekt, val alsnog terug op info@ om "Missing to" te voorkomen)
  */
 module.exports = async (req, res) => {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
   try {
-    if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const { email, subject, cta_url, contact, resultaat } = body;
 
-    let body = req.body;
-    if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch { return res.status(400).json({ error: 'Invalid JSON' }); }
+    // Testmodus: als je via curl de Vercel-bypass header meestuurt, sturen we naar info@
+    const bypassHeader = req.headers["x-vercel-protection-bypass"];
+    const isTest = Boolean(bypassHeader);
+
+    const TO = isTest ? "info@huisverkoopklaar.nl" : (email || "info@huisverkoopklaar.nl");
+    const BCC = "j.dekker@huisverkoopklaar.nl";
+    const REPLY_TO = (contact && contact.email) || email || "info@huisverkoopklaar.nl";
+
+    // --- PDF generatie (ASCII-safe) ---
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage();
+    const { height } = page.getSize();
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+    const safe = (t) =>
+      String(t || "")
+        .replace(/[^\x00-\x7F]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const lines = [
+      `Huisverkoopklaar - Waarderapport`,
+      `Naam: ${safe(contact?.naam)}`,
+      `E-mail: ${safe(contact?.email)}`,
+      `Geschatte waarde: €${safe(resultaat?.waarde_min)} - €${safe(resultaat?.waarde_max)}`,
+      `Afspraaklink: ${safe(cta_url)}`
+    ];
+
+    let y = height - 50;
+    for (const line of lines) {
+      page.drawText(line, { x: 50, y, size: 12, font, color: rgb(0, 0, 0) });
+      y -= 20;
     }
-    body ||= {};
 
-    const { to, subject = 'Woningwaarde rapport', html, text, bcc = [], attachments = [] } = body;
-    if (!to) return res.status(400).json({ error: 'Missing "to"' });
+    const pdfBytes = await pdfDoc.save();
 
-    const BREVO_API_KEY = process.env.BREVO_API_KEY;
-    const FROM_EMAIL    = process.env.FROM_EMAIL || 'no-reply@huisverkoopklaar.nl';
-    const DEFAULT_BCC   = process.env.BCC_EMAIL;
-
-    if (!BREVO_API_KEY) return res.status(500).json({ error: 'Missing BREVO_API_KEY env' });
-
-    // combineer bcc uit body met default bcc
-    const allBcc = [...(Array.isArray(bcc) ? bcc : []), ...(DEFAULT_BCC ? [DEFAULT_BCC] : [])]
-      .filter(Boolean)
-      .map(e => ({ email: e }));
-
-    // Brevo payload
-    const payload = {
-      sender: { email: FROM_EMAIL, name: 'Huisverkoopklaar' },
-      to: [{ email: to }],
-      bcc: allBcc.length ? allBcc : undefined,
-      subject,
-      htmlContent: html || '<p>Uw woningwaarde-rapport is gereed.</p>',
-      textContent: text,
-      attachment: attachments // [{ name, content(base64) }]
-    };
-
-    const r = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'api-key': BREVO_API_KEY,
-        'accept': 'application/json',
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(payload)
+    // --- Versturen via Resend ---
+    const data = await resend.emails.send({
+      from: "info@huisverkoopklaar.nl",
+      to: TO,
+      bcc: BCC,
+      reply_to: REPLY_TO,
+      subject: subject || "Waarderapport",
+      text: "In de bijlage vind je het PDF-waarderapport.",
+      attachments: [
+        {
+          filename: "waarderapport.pdf",
+          content: Buffer.from(pdfBytes).toString("base64"),
+        },
+      ],
     });
 
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(r.status).json({ error: data });
-
-    // CORS (handig als je direct vanuit frontend callt)
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') return res.status(204).end();
-
-    return res.status(200).json({ ok: true, brevo: data });
+    return res.status(200).json({ ok: true, id: data?.id || null, to: TO, test: isTest });
   } catch (err) {
-    return res.status(500).json({ error: String(err) });
+    console.error("send-pdf error:", err);
+    return res.status(500).json({
+      error: "Onverwachte serverfout",
+      details: err?.message || String(err),
+    });
   }
 };
