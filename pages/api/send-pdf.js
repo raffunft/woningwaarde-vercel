@@ -10,7 +10,6 @@ export default async function handler(req, res) {
     const resend = new Resend(process.env.RESEND_API_KEY);
     const { email, subject, cta_url, contact, resultaat } = req.body;
 
-    // --- PDF generatie ---
     const pdfDoc = await PDFDocument.create();
     const page = pdfDoc.addPage();
     const { width, height } = page.getSize();
@@ -22,23 +21,22 @@ export default async function handler(req, res) {
         .replace(/\s+/g, " ")
         .trim();
 
-    const tekst = [
+    const lines = [
       `Huisverkoopklaar - Waarderapport`,
       `Naam: ${safeText(contact?.naam)}`,
       `E-mail: ${safeText(contact?.email)}`,
       `Geschatte waarde: €${safeText(resultaat?.waarde_min)} - €${safeText(resultaat?.waarde_max)}`,
-      `Bekijk afspraak: ${cta_url}`,
+      `Afspraaklink: ${cta_url}`,
     ];
 
     let y = height - 50;
-    for (const line of tekst) {
+    for (const line of lines) {
       page.drawText(line, { x: 50, y, size: 12, font, color: rgb(0, 0, 0) });
       y -= 20;
     }
 
     const pdfBytes = await pdfDoc.save();
 
-    // --- Mail via Resend ---
     const data = await resend.emails.send({
       from: "info@huisverkoopklaar.nl",
       to: email,
@@ -55,10 +53,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true, id: data.id, to: email });
   } catch (err) {
-    console.error("Error sending email:", err);
+    console.error("Error:", err);
     return res.status(500).json({
       error: "Onverwachte serverfout",
-      details: err.message || err.toString(),
+      details: err.message || String(err),
     });
   }
 }
